@@ -21,17 +21,25 @@ GEONAMES_USERNAME = "demo"  # Replace with your GeoNames username
 GEONAMES_API_BASE = "http://api.geonames.org"
 
 # OpenAI API Configuration
-OPENAI_API_KEY = "OPENAI_API_KEY"
+OPENAI_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # GPT model version to use
-GPT_MODEL = "gpt-4.1-mini"
+# GPT_MODEL = "gpt-4.1-mini"
+# GPT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+GPT_MODEL = "gapgpt-qwen-3.5"
 
 # Proxy Configuration
 os.environ['https_proxy'] = ''
 os.environ['http_proxy'] = ''
 
 # Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# client = OpenAI(api_key=OPENAI_API_KEY)
+
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    # base_url="https://openrouter.ai/api/v1",
+    base_url="https://api.gapgpt.app/v1",
+)
 
 def get_completion(messages: List[Dict[str, str]], model: str = GPT_MODEL, temperature: float = 0.2, max_retries: int = 3) -> Optional[str]:
     """Call OpenAI GPT API to get response with retry mechanism
