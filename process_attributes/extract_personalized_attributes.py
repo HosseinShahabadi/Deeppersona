@@ -17,7 +17,7 @@ class PersonalizedAttributeExtractor:
             api_key=OPENAI_API_KEY,
         )
         # Load template categories
-        with open('/home/zhou/persona/dataset/3.20/template.json', 'r') as f:
+        with open('/home/hossein/deeppersona/Deeppersona/dataset/3.20/template.json', 'r') as f:
             template_data = json.load(f)
             self.persona_categories = template_data['persona_categories']
 

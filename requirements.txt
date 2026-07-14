@@ -1,0 +1,10 @@
+# Runtime dependencies for the DeepPersona generation pipeline.
+openai>=1.0.0
+geonamescache>=2.0.0
+numpy>=1.24
+tqdm>=4.65
+
+# Local embeddings (replaces OpenAI text-embedding-ada-002, which is not
+# served by OpenAI-compatible gateways such as OpenRouter).
+# Used by scripts/build_embeddings.py and generate_user_profile/embeddings.py.
+sentence-transformers>=3.0.0

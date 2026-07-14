@@ -35,3 +35,11 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# Generated embedding databases — rebuild locally with:
+#   python scripts/build_embeddings.py
+# (The upstream .pkl files were committed truncated/corrupt.)
+data/*.pkl
+
+# Generated output
+output/

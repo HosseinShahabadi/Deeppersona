@@ -359,7 +359,7 @@ def get_all_paths(d: dict, current_path: str = "") -> List[str]:
 
 def main():
     print("开始处理...")
-    input_file = "/home/zhou/persona/src/process_attributes_test/2.24/outputs/run_20250326_125810/attributes_merged.json"
+    input_file = "/home/hossein/deeppersona/Deeppersona/src/process_attributes_test/2.24/outputs/run_20250326_125810/attributes_merged.json"
     output_file = os.path.join(os.path.dirname(input_file), "filtered_attributes1.json")
     log_file = os.path.join(os.path.dirname(input_file), "filter_log1.txt")
     

@@ -683,7 +683,7 @@ def generate_multiple_profiles(num_rounds: int = 8) -> None:
     project_root = get_project_root()
     
     # 创建输出目录
-    output_dir = "/home/zhou/deeppersona/generate_user_profile_final/output"
+    output_dir = os.path.join(get_project_root(), "output")
     os.makedirs(output_dir, exist_ok=True)
     
     # 定义每个档案的属性数量
@@ -756,5 +756,80 @@ def generate_multiple_profiles(num_rounds: int = 8) -> None:
     print(f"\n所有 {all_profiles['metadata']['profiles_completed']} 个个人资料已成功生成并保存到: {all_profiles_path}")
     print(f"生成完成，耗时 {elapsed_time:.2f} 秒")
 
+def generate_profiles(num_profiles: int = 50, attribute_count: int = 200) -> str:
+    """Generate a batch of profiles, all at the same attribute count.
+
+    Args:
+        num_profiles: how many profiles to generate.
+        attribute_count: number of attributes to sample per profile.
+
+    Returns:
+        Path to the merged output JSON file.
+    """
+    start_time = time.time()
+    print(f"Generating {num_profiles} profiles at {attribute_count} attributes each...")
+
+    output_dir = os.path.join(get_project_root(), "output")
+    os.makedirs(output_dir, exist_ok=True)
+    all_profiles_path = os.path.join(output_dir, "profile_ind.json")
+
+    all_profiles = {
+        "metadata": {
+            "profiles_completed": 0,
+            "total_profiles": num_profiles,
+            "attribute_count": attribute_count,
+            "description": "Batch of user profiles at a fixed attribute count",
+        }
+    }
+    save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+
+    completed = 0
+    for i in range(num_profiles):
+        print(f"\n----- Generating profile {i + 1}/{num_profiles} -----\n")
+        try:
+            profile = generate_single_profile(None, i, attribute_count)
+            if not profile:
+                print(f"Profile {i + 1} failed, skipping.")
+                continue
+            all_profiles[f"Profile_{i + 1}_Count_{attribute_count}"] = profile
+            completed += 1
+            all_profiles["metadata"]["profiles_completed"] = completed
+            save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+            print(f"Progress: {completed}/{num_profiles} completed.")
+        except Exception as e:
+            print(f"Error generating profile {i + 1}: {e}")
+            continue
+
+    all_profiles["metadata"]["status"] = "completed"
+    save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+
+    elapsed = time.time() - start_time
+    print(f"\nDone. {completed} profiles saved to {all_profiles_path} in {elapsed:.1f}s.")
+    return all_profiles_path
+
+
 if __name__ == "__main__":
-    generate_multiple_profiles(10)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Batch-generate DeepPersona user profiles."
+    )
+    parser.add_argument(
+        "--num-profiles", type=int, default=50,
+        help="Number of profiles to generate (default: 50).",
+    )
+    parser.add_argument(
+        "--attribute-count", type=int, default=200,
+        help="Attributes to sample per profile (default: 200).",
+    )
+    parser.add_argument(
+        "--multi-depth", action="store_true",
+        help="Instead of a fixed count, sweep [100,150,200,250,300,350] "
+             "per round; --num-profiles is treated as the number of rounds.",
+    )
+    args = parser.parse_args()
+
+    if args.multi_depth:
+        generate_multiple_profiles(args.num_profiles)
+    else:
+        generate_profiles(args.num_profiles, args.attribute_count)

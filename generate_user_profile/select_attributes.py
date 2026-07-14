@@ -20,6 +20,7 @@ ATTRIBUTE_SELECTION_CACHE = None
 
 # 导入项目配置
 from config import client, GPT_MODEL, parse_json_response
+from embeddings import embed_query, MODEL_NAME as EMBED_MODEL_NAME
 
 # 定义get_completion函数
 def get_completion(messages, model=GPT_MODEL, temperature=0.7):
@@ -54,11 +55,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 属性数据集路径
-ATTRIBUTES_PATH = "/home/zhou/deeppersona/generate_user_profile_test/data/large_attributes.json"  # 属性数据集路径
+# Project root (one level up from this file's directory)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-# 向量数据库路径
-EMBEDDINGS_PATH = "/home/zhou/deeppersona/generate_user_profile_test/data/attribute_embeddings.pkl"  # 属性嵌入向量路径
+# Attribute dataset path (overridable via env var)
+ATTRIBUTES_PATH = os.environ.get(
+    "DEEPPERSONA_ATTRIBUTES_PATH",
+    os.path.join(DATA_DIR, "large_attributes.json"),
+)
+
+# Attribute embedding vectors path (overridable via env var)
+EMBEDDINGS_PATH = os.environ.get(
+    "DEEPPERSONA_EMBEDDINGS_PATH",
+    os.path.join(DATA_DIR, "attribute_embeddings.pkl"),
+)
 
 # 默认模型来自配置
 DEFAULT_MODEL = GPT_MODEL
@@ -129,37 +140,56 @@ class AttributeSelector:
         """加载属性嵌入向量数据库"""
         try:
             if not os.path.exists(EMBEDDINGS_PATH):
-                logger.warning(f"嵌入向量文件 {EMBEDDINGS_PATH} 不存在")
-                return None
-                
+                raise FileNotFoundError(
+                    f"Embeddings file not found: {EMBEDDINGS_PATH}\n"
+                    f"Build it first:  python scripts/build_embeddings.py"
+                )
+
             with open(EMBEDDINGS_PATH, 'rb') as f:
                 embeddings_data = pickle.load(f)
-                
+
             # 检查数据结构并标准化键名
             paths_key = 'attribute_paths' if 'attribute_paths' in embeddings_data else 'paths'
             embeddings_key = 'embeddings'
-            
+
             # 获取路径和嵌入向量
             paths = embeddings_data.get(paths_key, [])
             embeddings = embeddings_data.get(embeddings_key, [])
-            
+
             # 如果数据无效，返回空值
             if not isinstance(embeddings_data, dict) or not paths or not isinstance(embeddings, np.ndarray):
-                logger.warning("嵌入向量数据格式无效")
-                return None
-            
+                raise ValueError("Embeddings file has an invalid structure.")
+
+            # Warn if the database was built with a different model than the one
+            # that will embed the query at runtime — the vectors would live in
+            # different spaces and every cosine score would be meaningless.
+            built_with = embeddings_data.get('model')
+            if built_with and built_with != EMBED_MODEL_NAME:
+                logger.warning(
+                    "Embeddings were built with '%s' but runtime model is '%s'. "
+                    "Rebuild with: python scripts/build_embeddings.py",
+                    built_with, EMBED_MODEL_NAME,
+                )
+
             # 标准化返回的数据字典
             standardized_data = {
                 'paths': paths,
                 'embeddings': embeddings
             }
-                
-            logger.info(f"从 {EMBEDDINGS_PATH} 加载了 {len(paths)} 条属性嵌入向量")
+
+            logger.info(f"Loaded {len(paths)} attribute embeddings from {EMBEDDINGS_PATH}")
             return standardized_data
-            
+
         except Exception as e:
-            logger.error(f"加载嵌入向量时出错: {e}")
-            return None
+            # Do NOT swallow this. Upstream returned None here, which made the
+            # selector hand back an empty attribute list and produce hollow
+            # personas with no visible error.
+            raise RuntimeError(
+                f"Failed to load attribute embeddings from {EMBEDDINGS_PATH}: {e}\n"
+                f"If the file is corrupt or truncated (the upstream repo ships "
+                f"truncated .pkl files), regenerate it with:\n"
+                f"    python scripts/build_embeddings.py"
+            ) from e
     
     def _validate_data(self):
         """验证加载的数据并转换格式（如需要）"""
@@ -185,18 +215,15 @@ class AttributeSelector:
         try:
             # 提取配置文件摘要
             profile_summary = self._extract_profile_summary(profile)
-            
-            # 使用OpenAI API生成嵌入向量
-            response = client.embeddings.create(
-                model="text-embedding-ada-002",
-                input=profile_summary
-            )
-            
-            # 提取嵌入向量
-            embedding = np.array(response.data[0].embedding)
-            logger.info(f"成功为用户配置文件创建了嵌入向量")
+
+            # 使用本地 sentence-transformers 模型生成嵌入向量。
+            # (Previously called client.embeddings.create(model="text-embedding-ada-002"),
+            #  which fails against OpenAI-compatible gateways like OpenRouter that
+            #  do not serve the embeddings endpoint.)
+            embedding = embed_query(profile_summary)
+            logger.info("Created profile embedding (dim=%d)", embedding.shape[0])
             return embedding
-            
+
         except Exception as e:
             logger.error(f"创建配置文件嵌入向量时出错: {e}")
             return None
@@ -866,13 +893,16 @@ def build_nested_dict(paths: List[str]) -> Dict:
             current = current[part]
     return result
 
-def save_results(user_profile: Dict, selected_paths: List[str], output_dir: str = '/home/zhou/persona/generate_user_profile/output') -> None:
-    """
-    保存用户配置文件和选定的属性路径到文件
-    参数：
-        user_profile: 用户配置文件
-        selected_paths: 选定的属性路径 (列表形式)
-        output_dir: 输出目录（默认为 '/home/zhou/persona/generate_user_profile/output'）
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
+
+
+def save_results(user_profile: Dict, selected_paths: List[str], output_dir: str = DEFAULT_OUTPUT_DIR) -> None:
+    """Save the user profile and selected attribute paths to disk.
+
+    Args:
+        user_profile: the generated base user profile
+        selected_paths: selected attribute paths (as a list)
+        output_dir: output directory (defaults to <repo>/output)
     """
     try:
         from pathlib import Path
@@ -898,9 +928,9 @@ def save_results(user_profile: Dict, selected_paths: List[str], output_dir: str 
         logger.error(f"保存结果时出错: {e}")
         raise
 
-# 示例：在生成用户基本信息和属性列表的函数中自动调用保存（请根据实际情况将此调用添加到合适位置）
-user_profile = generate_user_profile()
-selected_paths = get_selected_attributes(user_profile)
-save_results(user_profile, selected_paths)
-
-# 此文件只供其他文件导入使用
+# This module is meant to be imported by generate_profile.py.
+# Running it directly performs a single standalone selection for testing.
+if __name__ == "__main__":
+    user_profile = generate_user_profile()
+    selected_paths = get_selected_attributes(user_profile)
+    save_results(user_profile, selected_paths)

@@ -47,7 +47,7 @@ Return only: true or false"""
 class PersonalizedAttributeAnalyzer:
     def __init__(self):
         # 读取模板文件中的一级属性
-        with open('/home/zhou/persona/dataset/2.7/template.json', 'r') as f:
+        with open('/home/hossein/deeppersona/Deeppersona/dataset/2.7/template.json', 'r') as f:
             template = json.load(f)
             self.valid_categories = list(template['persona_categories'])
     
