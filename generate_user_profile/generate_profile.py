@@ -359,7 +359,8 @@ def append_profile_to_json(file_path: str, profile: Dict, use_timestamp: bool = 
         return file_path
 
 
-def generate_single_profile(template: Dict = None, profile_index: int = 0, attribute_count: int = 200) -> Dict:
+def generate_single_profile(template: Dict = None, profile_index: int = 0, attribute_count: int = 200,
+                            country: str = None, city_weighting: str = "uniform") -> Dict:
     """根据给定的模板生成完整的用户档案。
     
     参数:
@@ -372,43 +373,32 @@ def generate_single_profile(template: Dict = None, profile_index: int = 0, attri
     """
 
     
-    # First, run select_attributes.py to update base files (user_profile.json and selected_paths.json)
-    print(f'Running select_attributes.py to update base files with {attribute_count} attributes...')
+    # Build the anchor profile and select its attributes.
+    print(f'Selecting {attribute_count} attributes for this profile...')
     try:
-        # 直接导入select_attributes模块的函数，而不是通过subprocess运行
         import sys
         import os
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from select_attributes import generate_user_profile as gen_profile
-        from select_attributes import get_selected_attributes, save_results
-        
-        # 生成用户配置文件
-        user_profile = gen_profile()
+        from select_attributes import get_selected_attributes, build_nested_dict
+
+        # 生成用户配置文件（optionally pinned to a country）
+        user_profile = gen_profile(country=country, city_weighting=city_weighting)
         # 获取指定数量的属性
-        selected_paths = get_selected_attributes(user_profile, attribute_count)
-        # 保存结果
-        correct_output_dir = os.path.join(get_project_root(), "output")
-        save_results(user_profile, selected_paths, correct_output_dir)
-        
-        # 复制文件从源位置到目标位置
-        copy_files_from_source_to_target()
+        selected_path_list = get_selected_attributes(user_profile, attribute_count)
     except Exception as e:
         print(f"Error executing select_attributes functions: {e}")
         return {}
 
-    # Load basic profile information and selected paths (base info is only a reference for GPT generation)
-    project_root = get_project_root()
-    output_dir = os.path.join(project_root, "output")
-    base_info_path = os.path.join(output_dir, 'user_profile.json')
-    with open(base_info_path, 'r', encoding='utf-8') as f:
-        base_info = json.load(f)
+    # Keep everything in memory. Upstream wrote user_profile.json and
+    # selected_paths.json to a *shared* output dir and immediately read them
+    # back — pointless I/O, and a corruption race as soon as two profiles are
+    # generated concurrently.
+    base_info = dict(user_profile)
     if 'Occupations' not in base_info:
-        print("Warning: 'Occupations' key is missing in the user profile. Setting it to an empty list.")
         base_info['Occupations'] = []
 
-    selected_paths_path = os.path.join(output_dir, 'selected_paths.json')
-    with open(selected_paths_path, 'r', encoding='utf-8') as f:
-        selected_paths = json.load(f)
+    selected_paths = build_nested_dict(selected_path_list)
 
     # Ensure these fields are strings
     for k in ("life_attitude", "interests"):
@@ -756,18 +746,33 @@ def generate_multiple_profiles(num_rounds: int = 8) -> None:
     print(f"\n所有 {all_profiles['metadata']['profiles_completed']} 个个人资料已成功生成并保存到: {all_profiles_path}")
     print(f"生成完成，耗时 {elapsed_time:.2f} 秒")
 
-def generate_profiles(num_profiles: int = 50, attribute_count: int = 200) -> str:
+def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
+                      country: str = None, city_weighting: str = "uniform",
+                      workers: int = 4) -> str:
     """Generate a batch of profiles, all at the same attribute count.
+
+    Profiles are independent of one another, so they are generated concurrently.
+    Within a single profile the LLM calls remain strictly sequential — each
+    section is conditioned on the ones before it, and that conditioning is what
+    produces internal coherence. Only the across-profile axis is parallelized.
 
     Args:
         num_profiles: how many profiles to generate.
         attribute_count: number of attributes to sample per profile.
+        country: pin every persona to this country (name or ISO code).
+        city_weighting: "uniform" or "population".
+        workers: number of profiles generated concurrently.
 
     Returns:
         Path to the merged output JSON file.
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     start_time = time.time()
-    print(f"Generating {num_profiles} profiles at {attribute_count} attributes each...")
+    where = f" in {country}" if country else ""
+    print(f"Generating {num_profiles} profiles{where} at {attribute_count} attributes each "
+          f"({workers} workers)...")
 
     output_dir = os.path.join(get_project_root(), "output")
     os.makedirs(output_dir, exist_ok=True)
@@ -778,33 +783,43 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200) -> str
             "profiles_completed": 0,
             "total_profiles": num_profiles,
             "attribute_count": attribute_count,
+            "country": country or "random",
+            "city_weighting": city_weighting,
             "description": "Batch of user profiles at a fixed attribute count",
         }
     }
-    save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
 
+    lock = threading.Lock()
     completed = 0
-    for i in range(num_profiles):
-        print(f"\n----- Generating profile {i + 1}/{num_profiles} -----\n")
-        try:
-            profile = generate_single_profile(None, i, attribute_count)
-            if not profile:
-                print(f"Profile {i + 1} failed, skipping.")
+
+    def _worker(i: int):
+        return i, generate_single_profile(None, i, attribute_count,
+                                          country=country,
+                                          city_weighting=city_weighting)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker, i) for i in range(num_profiles)]
+        for future in as_completed(futures):
+            try:
+                i, profile = future.result()
+            except Exception as e:
+                print(f"Profile failed: {e}")
                 continue
-            all_profiles[f"Profile_{i + 1}_Count_{attribute_count}"] = profile
-            completed += 1
-            all_profiles["metadata"]["profiles_completed"] = completed
-            save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
-            print(f"Progress: {completed}/{num_profiles} completed.")
-        except Exception as e:
-            print(f"Error generating profile {i + 1}: {e}")
-            continue
+            if not profile:
+                continue
+            with lock:
+                all_profiles[f"Profile_{i + 1}_Count_{attribute_count}"] = profile
+                completed += 1
+                all_profiles["metadata"]["profiles_completed"] = completed
+                save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+                print(f"Progress: {completed}/{num_profiles} completed.")
 
     all_profiles["metadata"]["status"] = "completed"
     save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
 
     elapsed = time.time() - start_time
-    print(f"\nDone. {completed} profiles saved to {all_profiles_path} in {elapsed:.1f}s.")
+    print(f"\nDone. {completed} profiles saved to {all_profiles_path} in {elapsed:.1f}s "
+          f"({elapsed / max(completed, 1):.1f}s per profile).")
     return all_profiles_path
 
 
@@ -823,13 +838,38 @@ if __name__ == "__main__":
         help="Attributes to sample per profile (default: 200).",
     )
     parser.add_argument(
+        "--country", type=str, default=None,
+        help="Pin all personas to this country, e.g. 'Iran', 'IR', 'Germany'. "
+             "Default: a random country per profile.",
+    )
+    parser.add_argument(
+        "--city-weighting", choices=["uniform", "population"], default="uniform",
+        help="How to pick a city within the country. 'population' weights by "
+             "city population so personas land where people actually live "
+             "(default: uniform, the original behaviour).",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Profiles to generate concurrently (default: 4).",
+    )
+    parser.add_argument(
         "--multi-depth", action="store_true",
         help="Instead of a fixed count, sweep [100,150,200,250,300,350] "
              "per round; --num-profiles is treated as the number of rounds.",
     )
     args = parser.parse_args()
 
+    if args.country:
+        # Fail fast on a typo rather than 40 profiles in.
+        import sys as _sys, os as _os
+        _sys.path.append(_os.path.dirname(_os.path.abspath(__file__)))
+        from based_data import resolve_country
+        resolve_country(args.country)
+
     if args.multi_depth:
         generate_multiple_profiles(args.num_profiles)
     else:
-        generate_profiles(args.num_profiles, args.attribute_count)
+        generate_profiles(args.num_profiles, args.attribute_count,
+                          country=args.country,
+                          city_weighting=args.city_weighting,
+                          workers=args.workers)

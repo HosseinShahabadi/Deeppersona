@@ -115,39 +115,101 @@ def generate_career_info(age: int) -> Dict[str, str]:
     career_status = random.choice(occupations)
     return {"status": career_status}
 
-def generate_location() -> Dict[str, str]:
-    """生成真实的地理位置信息。
+_geo_index = None
 
-    使用 GeoNames 数据库随机选择一个国家和城市。
+
+def _get_geo_index():
+    """Build (once) an index of countries and their cities.
+
+    The previous implementation constructed a GeonamesCache and linear-scanned
+    all ~25k cities on *every* profile. Doing it once and caching turns a
+    per-profile O(n) scan into an O(1) dict lookup.
+    """
+    global _geo_index
+    if _geo_index is not None:
+        return _geo_index
+
+    gc = GeonamesCache()
+    countries = gc.get_countries()
+
+    cities_by_cc: Dict[str, List[Dict]] = {}
+    for city in gc.get_cities().values():
+        cities_by_cc.setdefault(city['countrycode'], []).append(city)
+
+    # Lookup table so users can pass "France", "FR" or "FRA" interchangeably.
+    alias_to_cc = {}
+    for cc, meta in countries.items():
+        for key in (meta.get('name'), meta.get('iso'), meta.get('iso3')):
+            if key:
+                alias_to_cc[key.strip().lower()] = cc
+
+    _geo_index = {
+        'countries': countries,
+        'cities_by_cc': cities_by_cc,
+        'alias_to_cc': alias_to_cc,
+    }
+    return _geo_index
+
+
+def resolve_country(country: str) -> str:
+    """Resolve a country name/ISO code to its GeoNames country code.
+
+    Raises ValueError with suggestions if the country isn't recognized.
+    """
+    idx = _get_geo_index()
+    cc = idx['alias_to_cc'].get(country.strip().lower())
+    if cc:
+        return cc
+
+    # Offer near-misses rather than failing blankly.
+    needle = country.strip().lower()
+    close = sorted(
+        name for name in
+        {m['name'] for m in idx['countries'].values()}
+        if needle in name.lower() or name.lower() in needle
+    )[:5]
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    raise ValueError(f"Unrecognized country: {country!r}.{hint}")
+
+
+def generate_location(country: str = None,
+                      city_weighting: str = "uniform") -> Dict[str, str]:
+    """Generate a real geographic location.
+
+    Args:
+        country: Country name or ISO code (e.g. "France", "FR", "FRA").
+            If None, a country is chosen at random (original behaviour).
+        city_weighting: "uniform" picks any city with equal probability
+            (original behaviour). "population" weights the choice by city
+            population, which keeps personas concentrated in places people
+            actually live rather than in obscure villages.
 
     Returns:
-        Dict[str, str]: 包含以下字段的字典：
-            - country: 国家名称
-            - city: 城市名称
+        Dict with "country" and "city".
     """
-    gc = GeonamesCache()
+    idx = _get_geo_index()
+    countries = idx['countries']
 
-    # 获取所有国家
-    countries = gc.get_countries()
-    country_code = random.choice(list(countries.keys()))
-    country = countries[country_code]
+    if country:
+        country_code = resolve_country(country)
+    else:
+        country_code = random.choice(list(countries.keys()))
 
-    # 获取选国家的所有城市
-    cities = gc.get_cities()
-    country_cities = [city for city in cities.values() if city['countrycode'] == country_code]
+    country_meta = countries[country_code]
+    country_cities = idx['cities_by_cc'].get(country_code, [])
 
     if not country_cities:
-        return {
-            "country": country['name'],
-            "city": "Unknown City"
-        }
+        return {"country": country_meta['name'], "city": "Unknown City"}
 
-    # 随机选择一个城市
-    city_data = random.choice(country_cities)
+    if city_weighting == "population":
+        weights = [max(int(c.get('population', 0)), 1) for c in country_cities]
+        city_data = random.choices(country_cities, weights=weights, k=1)[0]
+    else:
+        city_data = random.choice(country_cities)
 
     return {
-        "country": country['name'],
-        "city": city_data['name']
+        "country": country_meta['name'],
+        "city": city_data['name'],
     }
 
 

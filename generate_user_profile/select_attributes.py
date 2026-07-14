@@ -14,6 +14,7 @@ from pathlib import Path
 import random
 import numpy as np
 import pickle
+import threading
 from tqdm import tqdm
 import time
 ATTRIBUTE_SELECTION_CACHE = None
@@ -80,6 +81,64 @@ MID_NEIGHBOR_COUNT = 2   # 中距离邻居数量
 FAR_NEIGHBOR_COUNT = 1   # 远距离邻居数量
 DIVERSITY_THRESHOLD = 0.7  # 多样性阈值（余弦相似度）
 
+_SHARED_DATA = None
+_SHARED_LOCK = threading.Lock()
+
+
+def _get_shared_data(selector: "AttributeSelector") -> Dict:
+    """Load the taxonomy and embedding matrix once per process.
+
+    Thread-safe (double-checked lock) so parallel profile workers all reuse a
+    single copy instead of each re-reading a ~9 MiB pickle from disk.
+
+    Also stacks the embeddings into one contiguous matrix so similarity becomes
+    a single mat-vec product instead of a per-path Python loop.
+    """
+    global _SHARED_DATA
+    if _SHARED_DATA is not None:
+        return _SHARED_DATA
+
+    with _SHARED_LOCK:
+        if _SHARED_DATA is not None:
+            return _SHARED_DATA
+
+        attributes = selector._load_json(ATTRIBUTES_PATH)
+        embeddings_data = selector._load_embeddings()
+
+        paths = embeddings_data.get('paths', [])
+        embeddings = embeddings_data.get('embeddings', [])
+
+        path_to_embedding = {}
+        path_to_index = {}
+        for i, path in enumerate(paths):
+            if i < len(embeddings):
+                path_to_embedding[path] = embeddings[i]
+                path_to_index[path] = i
+
+        matrix = np.asarray(embeddings, dtype=np.float32)
+        # Pre-normalize so cosine similarity reduces to a plain dot product.
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        matrix = matrix / norms
+
+        logger.info(
+            "Loaded %d attribute paths and a %s embedding matrix (shared).",
+            len(paths), matrix.shape,
+        )
+        logger.info("Loaded attributes with %d top-level categories.", len(attributes.keys()))
+
+        _SHARED_DATA = {
+            'attributes': attributes,
+            'embeddings_data': embeddings_data,
+            'paths': paths,
+            'embeddings': embeddings,
+            'path_to_embedding': path_to_embedding,
+            'path_to_index': path_to_index,
+            'embedding_matrix': matrix,
+        }
+        return _SHARED_DATA
+
+
 class AttributeSelector:
     """
     属性选择器类
@@ -95,38 +154,25 @@ class AttributeSelector:
             user_profile: 用户配置文件数据（可选）
         """
         self.model = model
-        
-        # OpenAI客户端已在config.py中设置
-        
-        # 加载属性数据
-        self.attributes = self._load_json(ATTRIBUTES_PATH)  # 加载属性数据
-        
+
+        # Heavy assets (taxonomy JSON + ~9 MiB embedding matrix) are loaded once
+        # process-wide and shared read-only across every AttributeSelector.
+        # Previously each profile rebuilt all of this from disk.
+        shared = _get_shared_data(self)
+
+        self.attributes = shared['attributes']
+        self.embeddings_data = shared['embeddings_data']
+        self.paths = shared['paths']
+        self.embeddings = shared['embeddings']
+        self.path_to_embedding = shared['path_to_embedding']
+        self.path_to_index = shared['path_to_index']
+        self.embedding_matrix = shared['embedding_matrix']
+
         # 设置用户配置文件
         self.user_profile = user_profile
-        
+
         # 验证数据
         self._validate_data()
-        
-        # 加载向量数据库
-        self.embeddings_data = self._load_embeddings()
-        
-        # 初始化属性路径和向量映射
-        self.path_to_embedding = {}
-        self.paths = []
-        self.embeddings = []
-        
-        if self.embeddings_data:
-            self.paths = self.embeddings_data.get('paths', [])
-            self.embeddings = self.embeddings_data.get('embeddings', [])
-            
-            # 创建路径到向量的映射
-            for i, path in enumerate(self.paths):
-                if i < len(self.embeddings):
-                    self.path_to_embedding[path] = self.embeddings[i]
-            
-            logger.info(f"已加载 {len(self.paths)} 条属性路径和对应的向量嵌入")
-        
-        logger.info(f"已加载属性，包含 {len(self.attributes.keys())} 个顶级类别")
     
     def _load_json(self, file_path: str) -> Dict:
         """从文件加载JSON数据"""
@@ -653,15 +699,24 @@ class AttributeSelector:
             logger.warning("没有有效的属性路径匹配向量数据库，返回空列表")
             return []
         
-        # 计算每个路径与配置文件的相似度
-        path_similarities = []
-        for path in valid_paths:
-            embedding = self.path_to_embedding[path]
-            similarity = self._compute_cosine_similarity(profile_embedding, embedding)
-            path_similarities.append((path, similarity))
-        
-        # 按相似度排序
-        path_similarities.sort(key=lambda x: x[1], reverse=True)
+        # Vectorized cosine similarity: one mat-vec product instead of a Python
+        # loop that recomputed norms for every path. Mathematically identical to
+        # the original (both matrix and query are L2-normalized, so the dot
+        # product *is* the cosine), just ~2 orders of magnitude faster.
+        query = np.asarray(profile_embedding, dtype=np.float32)
+        qnorm = np.linalg.norm(query)
+        if qnorm == 0:
+            logger.warning("Profile embedding is a zero vector; returning empty list.")
+            return []
+        query = query / qnorm
+
+        indices = np.fromiter(
+            (self.path_to_index[p] for p in valid_paths), dtype=np.int64, count=len(valid_paths)
+        )
+        sims = self.embedding_matrix[indices] @ query
+
+        order = np.argsort(-sims)
+        path_similarities = [(valid_paths[i], float(sims[i])) for i in order]
         
         # 计算要选择的数量
         total_paths = len(path_similarities)
@@ -799,12 +854,19 @@ class AttributeSelector:
     
 
 
-def generate_user_profile() -> Dict:
-    """生成用户基础信息配置文件"""
+def generate_user_profile(country: str = None,
+                          city_weighting: str = "uniform") -> Dict:
+    """生成用户基础信息配置文件
+
+    Args:
+        country: Restrict the persona to this country (name or ISO code).
+            None keeps the original behaviour of sampling a random country.
+        city_weighting: "uniform" (original) or "population".
+    """
     # 生成并存储直接函数返回值
     age_info = generate_age_info()
     gender = generate_gender()
-    location = generate_location()
+    location = generate_location(country=country, city_weighting=city_weighting)
     career_info = generate_career_info(age_info["age"])
     
     # 生成个人价值观
@@ -851,7 +913,8 @@ def generate_user_profile() -> Dict:
     
     return user_profile
 
-def get_selected_attributes(user_profile=None, attribute_count=200):
+def get_selected_attributes(user_profile=None, attribute_count=200,
+                            country: str = None, city_weighting: str = "uniform"):
     global ATTRIBUTE_SELECTION_CACHE
     # 注释掉缓存机制，确保每次都重新选择属性
     # if ATTRIBUTE_SELECTION_CACHE is not None:
@@ -860,7 +923,8 @@ def get_selected_attributes(user_profile=None, attribute_count=200):
     try:
         # 如果没有提供用户配置文件，生成一个
         if user_profile is None:
-            user_profile = generate_user_profile()
+            user_profile = generate_user_profile(country=country,
+                                                 city_weighting=city_weighting)
         
         # 创建选择器并传入用户配置文件
         selector = AttributeSelector(user_profile=user_profile)
