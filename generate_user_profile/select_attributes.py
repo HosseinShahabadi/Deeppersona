@@ -24,17 +24,23 @@ from config import client, GPT_MODEL, parse_json_response
 from embeddings import embed_query, MODEL_NAME as EMBED_MODEL_NAME
 
 # 定义get_completion函数
-def get_completion(messages, model=GPT_MODEL, temperature=0.7):
-    """使用OpenAI API生成文本完成"""
+def get_completion(messages, model=None, temperature=0.7):
+    """Generate a text completion.
+
+    The model is resolved from config at *call* time, not import time, so that
+    --model / set_model() actually takes effect here. Throttling and 429 retry
+    are handled inside the wrapped client in config.py.
+    """
+    import config
     try:
         response = client.chat.completions.create(
-            model=model,
+            model=model or config.GPT_MODEL,
             messages=messages,
             temperature=temperature
         )
         return response.choices[0].message.content
     except Exception as e:
-        logger.error(f"Error calling OpenAI API: {e}")
+        logger.error(f"Error calling API: {e}")
         return None
 
 # 导入based_data模块中的函数
@@ -72,7 +78,7 @@ EMBEDDINGS_PATH = os.environ.get(
     os.path.join(DATA_DIR, "attribute_embeddings.pkl"),
 )
 
-# 默认模型来自配置
+# 默认模型来自配置 (resolved lazily; see get_completion)
 DEFAULT_MODEL = GPT_MODEL
 
 # 向量搜索参数

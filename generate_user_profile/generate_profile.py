@@ -853,11 +853,32 @@ if __name__ == "__main__":
         help="Profiles to generate concurrently (default: 4).",
     )
     parser.add_argument(
+        "--delay", type=float, default=None,
+        help="Minimum seconds between API calls, enforced globally across all "
+             "workers. Use with free OpenRouter models to stay under their rate "
+             "limit (free tier is ~20 req/min, so --delay 3 is a safe start). "
+             "Default: no delay.",
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="OpenRouter model slug, e.g. "
+             "'deepseek/deepseek-chat-v3-0324:free'. Overrides DEEPPERSONA_MODEL.",
+    )
+    parser.add_argument(
         "--multi-depth", action="store_true",
         help="Instead of a fixed count, sweep [100,150,200,250,300,350] "
              "per round; --num-profiles is treated as the number of rounds.",
     )
     args = parser.parse_args()
+
+    # Apply API settings before any generation begins.
+    import config as _config
+    if args.delay is not None:
+        _config.set_api_delay(args.delay)
+        print(f"Rate limiting: minimum {args.delay}s between API calls (global).")
+    if args.model:
+        _config.set_model(args.model)
+        print(f"Model: {args.model}")
 
     if args.country:
         # Fail fast on a typo rather than 40 profiles in.
