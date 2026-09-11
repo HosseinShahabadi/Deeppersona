@@ -362,17 +362,18 @@ def append_profile_to_json(file_path: str, profile: Dict, use_timestamp: bool = 
 def generate_single_profile(template: Dict = None, profile_index: int = 0, attribute_count: int = 200,
                             country: str = None, city_weighting: str = "uniform") -> Dict:
     """根据给定的模板生成完整的用户档案。
-    
+
     参数:
         template: 可选的用于生成的模板。
         profile_index: 要生成的档案索引。
         attribute_count: 要包含的属性数量。
-        
+        country: 将角色限定在此国家（名称或 ISO 代码）。None 表示随机国家。
+        city_weighting: "uniform"（原始行为）或 "population"。
+
     返回:
         Dict: 生成的用户档案。
     """
 
-    
     # Build the anchor profile and select its attributes.
     print(f'Selecting {attribute_count} attributes for this profile...')
     try:
@@ -382,9 +383,9 @@ def generate_single_profile(template: Dict = None, profile_index: int = 0, attri
         from select_attributes import generate_user_profile as gen_profile
         from select_attributes import get_selected_attributes, build_nested_dict
 
-        # 生成用户配置文件（optionally pinned to a country）
+        # 生成用户配置文件（可选地限定国家）
         user_profile = gen_profile(country=country, city_weighting=city_weighting)
-        # 获取指定数量的属性
+        # 获取指定数量的属性（扁平路径列表 —— 这是覆盖率/分布分析所需的真值）
         selected_path_list = get_selected_attributes(user_profile, attribute_count)
     except Exception as e:
         print(f"Error executing select_attributes functions: {e}")
@@ -406,12 +407,18 @@ def generate_single_profile(template: Dict = None, profile_index: int = 0, attri
 
     # Example assertion: ensure the profile includes an 'Occupations' field
     assert 'Occupations' in base_info, "The 'Occupations' key is missing in the user profile."
-    
+
     # 初始化个人资料字典
     profile = {
         "Base Info": base_info,
         "Generated At": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "Profile Index": profile_index + 1
+        "Profile Index": profile_index + 1,
+        # Ground truth of what the sampler actually chose, before it gets
+        # matched (or dropped) against the 7 canonical output sections below.
+        # This is what scripts/analyze_profiles.py reads for attribute
+        # coverage and category-leakage measurement.
+        "_selected_attributes": selected_path_list,
+        "_attribute_count_requested": attribute_count,
     }
     
     # 步骤1：生成 Demographic Information
@@ -645,17 +652,22 @@ def generate_single_profile(template: Dict = None, profile_index: int = 0, attri
         print('No valid "Other Attributes" template found in selected_paths, skipping.')
 
     # Prepare a copy of profile for summary generation by removing unwanted keys
+    # (this trims what gets stuffed into the LLM prompt context — it does not
+    # affect the final saved profile).
     profile_for_summary = profile.copy()
-    for key in ['base_info', 'Base Info', 'personal_story', 'interests', 'Occupations']:
+    for key in ['base_info', 'Base Info', 'personal_story', 'interests', 'Occupations',
+                '_selected_attributes', '_attribute_count_requested']:
          profile_for_summary.pop(key, None)
     
     # Generate the final summary using the filtered profile and base_info
     final_summary_text = generate_final_summary(profile_for_summary, base_info)
     profile["Summary"] = final_summary_text
-    
-    # Remove unwanted keys from the final profile
-    for key in ['base_info', 'Base Info', 'personal_story', 'interests', 'Occupations']:
-         profile.pop(key, None)
+
+    # NOTE: upstream deleted 'Base Info' (and other keys) from the real
+    # `profile` dict here before returning it — silently discarding age,
+    # gender, location and career from every saved profile, which makes any
+    # demographic distribution analysis on profile_ind.json impossible.
+    # Base Info is now preserved.
 
     return profile
 
@@ -748,7 +760,7 @@ def generate_multiple_profiles(num_rounds: int = 8) -> None:
 
 def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
                       country: str = None, city_weighting: str = "uniform",
-                      workers: int = 4) -> str:
+                      workers: int = 4, resume: bool = False) -> str:
     """Generate a batch of profiles, all at the same attribute count.
 
     Profiles are independent of one another, so they are generated concurrently.
@@ -757,11 +769,15 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
     produces internal coherence. Only the across-profile axis is parallelized.
 
     Args:
-        num_profiles: how many profiles to generate.
+        num_profiles: target total number of completed profiles.
         attribute_count: number of attributes to sample per profile.
         country: pin every persona to this country (name or ISO code).
         city_weighting: "uniform" or "population".
         workers: number of profiles generated concurrently.
+        resume: if True and an existing output file is found, only generate
+            enough additional profiles to reach num_profiles total. Needed for
+            large runs (hundreds+) that may be interrupted by a crash, a rate
+            limit that exhausts retries, or a daily free-tier cap.
 
     Returns:
         Path to the merged output JSON file.
@@ -771,8 +787,6 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
 
     start_time = time.time()
     where = f" in {country}" if country else ""
-    print(f"Generating {num_profiles} profiles{where} at {attribute_count} attributes each "
-          f"({workers} workers)...")
 
     output_dir = os.path.join(get_project_root(), "output")
     os.makedirs(output_dir, exist_ok=True)
@@ -788,9 +802,37 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
             "description": "Batch of user profiles at a fixed attribute count",
         }
     }
+    completed_indices = set()
+
+    if resume and os.path.exists(all_profiles_path):
+        try:
+            with open(all_profiles_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            for key, value in existing.items():
+                if key == "metadata" or not isinstance(value, dict):
+                    continue
+                idx = value.get("Profile Index")
+                if isinstance(idx, int):
+                    completed_indices.add(idx - 1)  # stored 1-based, used 0-based
+            all_profiles = existing
+            all_profiles.setdefault("metadata", {})
+            print(f"Resuming: {len(completed_indices)} profile(s) already in {all_profiles_path}.")
+        except Exception as e:
+            print(f"Could not read existing output for --resume ({e}); starting fresh.")
+
+    remaining = [i for i in range(num_profiles) if i not in completed_indices]
+    print(f"Generating {len(remaining)} profile(s){where} at {attribute_count} attributes each "
+          f"({workers} workers) — target {num_profiles} total, "
+          f"{len(completed_indices)} already done.")
+
+    if not remaining:
+        print("Nothing to do — target already met.")
+        all_profiles["metadata"]["status"] = "completed"
+        save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+        return all_profiles_path
 
     lock = threading.Lock()
-    completed = 0
+    completed = len(completed_indices)
 
     def _worker(i: int):
         return i, generate_single_profile(None, i, attribute_count,
@@ -798,7 +840,7 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
                                           city_weighting=city_weighting)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_worker, i) for i in range(num_profiles)]
+        futures = [pool.submit(_worker, i) for i in remaining]
         for future in as_completed(futures):
             try:
                 i, profile = future.result()
@@ -814,12 +856,16 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
                 save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
                 print(f"Progress: {completed}/{num_profiles} completed.")
 
-    all_profiles["metadata"]["status"] = "completed"
+    all_profiles["metadata"]["status"] = "completed" if completed >= num_profiles else "interrupted"
     save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
 
     elapsed = time.time() - start_time
-    print(f"\nDone. {completed} profiles saved to {all_profiles_path} in {elapsed:.1f}s "
-          f"({elapsed / max(completed, 1):.1f}s per profile).")
+    n_this_run = completed - len(completed_indices)
+    print(f"\nDone. {completed}/{num_profiles} profiles total in {all_profiles_path}. "
+          f"This run added {n_this_run} in {elapsed:.1f}s "
+          f"({elapsed / max(n_this_run, 1):.1f}s/profile).")
+    if completed < num_profiles:
+        print(f"Run again with --resume to continue toward {num_profiles}.")
     return all_profiles_path
 
 
@@ -831,7 +877,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-profiles", type=int, default=50,
-        help="Number of profiles to generate (default: 50).",
+        help="Target total number of profiles (default: 50).",
     )
     parser.add_argument(
         "--attribute-count", type=int, default=200,
@@ -853,37 +899,101 @@ if __name__ == "__main__":
         help="Profiles to generate concurrently (default: 4).",
     )
     parser.add_argument(
+        "--api-key", type=str, default=None,
+        help="API key for the completions endpoint. Works with any "
+             "OpenAI-compatible provider (OpenRouter, your own LiteLLM "
+             "gateway, etc.) — not OpenRouter-specific. Overrides "
+             "OPENROUTER_API_KEY. Prefer the env var over typing this on the "
+             "command line where shell history or process lists are visible.",
+    )
+    parser.add_argument(
+        "--endpoint", type=str, default=None,
+        help="Base URL of the completions endpoint, e.g. "
+             "'https://porsera.com/llm' for a self-hosted gateway, or "
+             "'https://openrouter.ai/api/v1' (the default). "
+             "Overrides OPENROUTER_BASE_URL.",
+    )
+    parser.add_argument(
         "--delay", type=float, default=None,
         help="Minimum seconds between API calls, enforced globally across all "
-             "workers. Use with free OpenRouter models to stay under their rate "
-             "limit (free tier is ~20 req/min, so --delay 3 is a safe start). "
-             "Default: no delay.",
+             "workers. Mainly useful for free-tier models with tight rate "
+             "limits (e.g. --delay 3). With a paid/dedicated endpoint you can "
+             "usually leave this unset. Default: no delay.",
     )
     parser.add_argument(
         "--model", type=str, default=None,
-        help="OpenRouter model slug, e.g. "
-             "'deepseek/deepseek-chat-v3-0324:free'. Overrides DEEPPERSONA_MODEL.",
+        help="Model slug/name as your endpoint expects it, e.g. "
+             "'deepseek/deepseek-chat-v3-0324:free' on OpenRouter, or "
+             "whatever name your own gateway routes on. Overrides DEEPPERSONA_MODEL.",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="If output/profile_ind.json already exists, only generate enough "
+             "additional profiles to reach --num-profiles total. Use this for "
+             "large runs that may be interrupted (rate limits, daily caps, "
+             "crashes) — re-running the same command with --resume picks up "
+             "where it left off instead of starting over.",
     )
     parser.add_argument(
         "--multi-depth", action="store_true",
         help="Instead of a fixed count, sweep [100,150,200,250,300,350] "
              "per round; --num-profiles is treated as the number of rounds.",
     )
+    parser.add_argument(
+        "--skip-validation", action="store_true",
+        help="Skip the startup connectivity check (one tiny completion call) "
+             "that confirms the api-key/endpoint/model actually work before "
+             "committing to a long run.",
+    )
     args = parser.parse_args()
 
-    # Apply API settings before any generation begins.
+    # config.py is imported at the top of this file (`from config import
+    # get_completion`), so its client is already built by the time we get
+    # here — setting os.environ now would be too late to affect it. Use the
+    # setter functions instead; they rebuild the client in place.
     import config as _config
+    if args.api_key:
+        _config.set_api_key(args.api_key)
+    if args.endpoint:
+        _config.set_base_url(args.endpoint)
     if args.delay is not None:
         _config.set_api_delay(args.delay)
         print(f"Rate limiting: minimum {args.delay}s between API calls (global).")
     if args.model:
         _config.set_model(args.model)
-        print(f"Model: {args.model}")
+
+    masked_key = (_config.OPENROUTER_API_KEY[:8] + "..." if _config.OPENROUTER_API_KEY else "(not set)")
+    print(f"Endpoint : {_config.OPENROUTER_BASE_URL}")
+    print(f"Model    : {_config.GPT_MODEL}")
+    print(f"API key  : {masked_key}")
+
+    if not args.skip_validation:
+        print("Checking endpoint/key/model with a test call...", end=" ", flush=True)
+        # get_completion's retry behavior comes from the wrapped client, driven
+        # by the module-global API_MAX_RETRIES — temporarily lower it so this
+        # one check fails fast instead of retrying 5x (~15s) on a bad endpoint.
+        _prev_retries = _config.API_MAX_RETRIES
+        _config.API_MAX_RETRIES = 1
+        test_reply = _config.get_completion(
+            [{"role": "user", "content": "Reply with exactly one word: OK"}]
+        )
+        _config.API_MAX_RETRIES = _prev_retries
+        if not test_reply:
+            print("FAILED")
+            print(
+                "The test call did not return a response. Before running a long "
+                "batch, check: the endpoint URL is reachable, the API key is "
+                "valid for that endpoint, and the model name is one that "
+                "endpoint actually serves. Re-run with --skip-validation to "
+                "bypass this check (not recommended for a large --num-profiles)."
+            )
+            raise SystemExit(1)
+        print(f"OK ({test_reply.strip()[:40]!r})")
 
     if args.country:
-        # Fail fast on a typo rather than 40 profiles in.
-        import sys as _sys, os as _os
-        _sys.path.append(_os.path.dirname(_os.path.abspath(__file__)))
+        # Fail fast on a typo rather than N profiles in.
+        import sys as _sys
+        _sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from based_data import resolve_country
         resolve_country(args.country)
 
@@ -893,4 +1003,5 @@ if __name__ == "__main__":
         generate_profiles(args.num_profiles, args.attribute_count,
                           country=args.country,
                           city_weighting=args.city_weighting,
-                          workers=args.workers)
+                          workers=args.workers,
+                          resume=args.resume)
