@@ -81,19 +81,19 @@ def flatten_taxonomy(attributes: Dict) -> List[str]:
     return result
 
 
-def load_taxonomy_categories(taxonomy_path: str) -> Tuple[Dict[str, int], int]:
-    """Return {top_level_category: leaf_count} and total leaf count."""
+def load_taxonomy_categories(taxonomy_path: str) -> Tuple[Dict[str, int], List[str]]:
+    """Return per-category leaf counts and every fully qualified leaf path."""
     if not os.path.exists(taxonomy_path):
-        return {}, 0
+        return {}, []
     with open(taxonomy_path, "r", encoding="utf-8") as f:
         attributes = json.load(f)
     per_category = {}
-    total = 0
+    all_leaves = []
     for category, subtree in attributes.items():
         leaves = flatten_taxonomy({category: subtree})
         per_category[category] = len(leaves)
-        total += len(leaves)
-    return per_category, total
+        all_leaves.extend(leaves)
+    return per_category, all_leaves
 
 
 def top_level(path: str) -> str:
@@ -170,7 +170,9 @@ def analyze_demographics(profiles: List[Dict]) -> Dict:
 # --------------------------------------------------------------------------
 
 def analyze_attribute_coverage(profiles: List[Dict], taxonomy_path: str) -> Dict:
-    per_category_size, total_leaves = load_taxonomy_categories(taxonomy_path)
+    per_category_size, taxonomy_leaves = load_taxonomy_categories(taxonomy_path)
+    taxonomy_leaf_set = set(taxonomy_leaves)
+    total_leaves = len(taxonomy_leaf_set)
 
     all_selected: List[str] = []
     per_profile_counts = []
@@ -209,7 +211,23 @@ def analyze_attribute_coverage(profiles: List[Dict], taxonomy_path: str) -> Dict
         if per_profile_counts else None
     )
     result["most_selected"] = freq.most_common(20)
-    result["least_selected"] = sorted(freq.items(), key=lambda kv: kv[1])[:20]
+    result["least_selected_observed"] = sorted(freq.items(), key=lambda kv: (kv[1], kv[0]))[:20]
+
+    # A coverage report must include attributes selected zero times.  The old
+    # script only reported the least frequent *observed* attributes, which hid
+    # the largest coverage gap in every run.
+    unselected = sorted(taxonomy_leaf_set - set(freq))
+    unknown_selected = sorted(set(freq) - taxonomy_leaf_set) if taxonomy_leaf_set else []
+    result["never_selected_count"] = len(unselected)
+    result["never_selected_sample"] = unselected[:100]
+    result["selected_paths_missing_from_taxonomy"] = unknown_selected[:100]
+    result["selected_paths_missing_from_taxonomy_count"] = len(unknown_selected)
+    if not taxonomy_leaf_set:
+        result["taxonomy_warning"] = (
+            f"Taxonomy not found or contains no leaves: {taxonomy_path}. "
+            "Demographic and section-fill analysis is valid, but attribute "
+            "coverage cannot be calculated."
+        )
 
     # Per-category selection vs category size in the taxonomy.
     cat_selected = Counter(top_level(p) for p in all_selected)
@@ -370,11 +388,18 @@ def print_report(demographics: Dict, coverage: Dict, fill_rate: Dict) -> None:
     if "warning" in coverage:
         print(f"  WARNING: {coverage['warning']}")
     else:
+        if coverage.get("taxonomy_warning"):
+            print(f"  WARNING: {coverage['taxonomy_warning']}")
         print(f"  Taxonomy leaves: {coverage['taxonomy_total_leaves']}")
         print(f"  Unique leaves ever selected: {coverage['unique_leaves_selected']} "
               f"({coverage['coverage_pct']}% coverage)")
         print(f"  Avg attributes per profile: {coverage['avg_attributes_per_profile']}")
         print(f"  Most selected (top 5): {coverage['most_selected'][:5]}")
+        print(f"  Never selected: {coverage['never_selected_count']} "
+              f"(sample of up to 10: {coverage['never_selected_sample'][:10]})")
+        if coverage["selected_paths_missing_from_taxonomy_count"]:
+            print("  WARNING: selected paths not found in the supplied taxonomy: "
+                  f"{coverage['selected_paths_missing_from_taxonomy_count']}")
         leak = coverage["leakage"]
         print(f"\n  CATEGORY LEAKAGE: {leak['leaked_count']}/{leak['total_selected']} "
               f"selections ({leak['leaked_pct']}%) fall under a non-canonical category "

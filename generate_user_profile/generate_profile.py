@@ -760,7 +760,8 @@ def generate_multiple_profiles(num_rounds: int = 8) -> None:
 
 def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
                       country: str = None, city_weighting: str = "uniform",
-                      workers: int = 4, resume: bool = False) -> str:
+                      workers: int = 4, resume: bool = False,
+                      cost_report_path: str = None) -> str:
     """Generate a batch of profiles, all at the same attribute count.
 
     Profiles are independent of one another, so they are generated concurrently.
@@ -783,6 +784,7 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
         Path to the merged output JSON file.
     """
     import threading
+    import config
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     start_time = time.time()
@@ -791,6 +793,18 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
     output_dir = os.path.join(get_project_root(), "output")
     os.makedirs(output_dir, exist_ok=True)
     all_profiles_path = os.path.join(output_dir, "profile_ind.json")
+
+    if cost_report_path:
+        config.start_cost_tracking(cost_report_path, {
+            "model": config.GPT_MODEL,
+            "endpoint": config.OPENROUTER_BASE_URL,
+            "num_profiles_target": num_profiles,
+            "attribute_count": attribute_count,
+            "country": country or "random",
+            "city_weighting": city_weighting,
+            "workers": workers,
+            "resume": resume,
+        })
 
     all_profiles = {
         "metadata": {
@@ -835,9 +849,13 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
     completed = len(completed_indices)
 
     def _worker(i: int):
-        return i, generate_single_profile(None, i, attribute_count,
-                                          country=country,
-                                          city_weighting=city_weighting)
+        token = config.set_request_context(profile_index=i + 1)
+        try:
+            return i, generate_single_profile(None, i, attribute_count,
+                                              country=country,
+                                              city_weighting=city_weighting)
+        finally:
+            config.reset_request_context(token)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_worker, i) for i in remaining]
@@ -854,10 +872,14 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
                 completed += 1
                 all_profiles["metadata"]["profiles_completed"] = completed
                 save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+                if cost_report_path:
+                    config.write_cost_report("in_progress")
                 print(f"Progress: {completed}/{num_profiles} completed.")
 
     all_profiles["metadata"]["status"] = "completed" if completed >= num_profiles else "interrupted"
     save_json_file(all_profiles_path, all_profiles, use_timestamp=False)
+    final_status = all_profiles["metadata"]["status"]
+    cost_report = config.write_cost_report(final_status) if cost_report_path else None
 
     elapsed = time.time() - start_time
     n_this_run = completed - len(completed_indices)
@@ -866,6 +888,13 @@ def generate_profiles(num_profiles: int = 50, attribute_count: int = 200,
           f"({elapsed / max(n_this_run, 1):.1f}s/profile).")
     if completed < num_profiles:
         print(f"Run again with --resume to continue toward {num_profiles}.")
+    if cost_report:
+        totals = cost_report["totals"]
+        amount = totals["openrouter_cost_usd"]
+        display_amount = f"${amount:.8f}" if amount is not None else "not returned by endpoint"
+        print(f"Cost report: {cost_report_path}")
+        print(f"OpenRouter cost: {display_amount} | API requests: {totals['api_requests']} | "
+              f"tokens: {totals['total_tokens']}")
     return all_profiles_path
 
 
@@ -935,6 +964,11 @@ if __name__ == "__main__":
              "where it left off instead of starting over.",
     )
     parser.add_argument(
+        "--no-cost-report", action="store_true",
+        help="Disable OpenRouter usage/cost reporting. By default a JSON ledger "
+             "is written to output/cost_reports/ for every fixed-count run.",
+    )
+    parser.add_argument(
         "--multi-depth", action="store_true",
         help="Instead of a fixed count, sweep [100,150,200,250,300,350] "
              "per round; --num-profiles is treated as the number of rounds.",
@@ -1000,8 +1034,14 @@ if __name__ == "__main__":
     if args.multi_depth:
         generate_multiple_profiles(args.num_profiles)
     else:
+        cost_report_path = None
+        if not args.no_cost_report:
+            report_dir = os.path.join(get_project_root(), "output", "cost_reports")
+            report_name = f"cost_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            cost_report_path = os.path.join(report_dir, report_name)
         generate_profiles(args.num_profiles, args.attribute_count,
                           country=args.country,
                           city_weighting=args.city_weighting,
                           workers=args.workers,
-                          resume=args.resume)
+                          resume=args.resume,
+                          cost_report_path=cost_report_path)

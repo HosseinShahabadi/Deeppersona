@@ -20,7 +20,7 @@ import time
 ATTRIBUTE_SELECTION_CACHE = None
 
 # 导入项目配置
-from config import client, GPT_MODEL, parse_json_response
+from config import parse_json_response
 from embeddings import embed_query, MODEL_NAME as EMBED_MODEL_NAME
 
 # 定义get_completion函数
@@ -32,16 +32,7 @@ def get_completion(messages, model=None, temperature=0.7):
     are handled inside the wrapped client in config.py.
     """
     import config
-    try:
-        response = client.chat.completions.create(
-            model=model or config.GPT_MODEL,
-            messages=messages,
-            temperature=temperature
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Error calling API: {e}")
-        return None
+    return config.get_completion(messages, model=model, temperature=temperature)
 
 # 导入based_data模块中的函数
 from based_data import (
@@ -79,7 +70,9 @@ EMBEDDINGS_PATH = os.environ.get(
 )
 
 # 默认模型来自配置 (resolved lazily; see get_completion)
-DEFAULT_MODEL = GPT_MODEL
+# Keep this as None so config.get_completion resolves the model at call time.
+# That preserves --model and DEEPPERSONA_MODEL overrides made after import.
+DEFAULT_MODEL = None
 
 # 向量搜索参数
 NEAR_NEIGHBOR_COUNT = 7  # 近邻数量

@@ -12,6 +12,9 @@ import json
 import time
 import random
 import threading
+from collections import defaultdict
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from openai import OpenAI
 from typing import List, Dict, Optional, Any, Tuple
 
@@ -104,6 +107,137 @@ _rate_lock = threading.Lock()
 _last_call_at = 0.0
 
 
+# OpenRouter includes token accounting and, for normal (non-BYOK) requests,
+# the billed USD amount in the `usage` object of a completion response.  Keep
+# the raw value it reports rather than attempting to duplicate its routing and
+# pricing calculations locally.
+_request_context: ContextVar[Dict[str, Any]] = ContextVar("request_context", default={})
+
+
+class CostTracker:
+    """Thread-safe collector for OpenRouter usage and billed-cost metadata."""
+
+    def __init__(self, report_path: str, run_metadata: Optional[Dict[str, Any]] = None):
+        self.report_path = report_path
+        self.run_metadata = dict(run_metadata or {})
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.events: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _value(obj: Any, name: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    def record(self, response: Any, requested_model: str) -> None:
+        usage = self._value(response, "usage")
+        if usage is None:
+            return
+
+        # `cost` is OpenRouter's actual billed cost. It can be absent when a
+        # compatible non-OpenRouter endpoint is used, so preserve that state
+        # instead of publishing an estimate as if it were an invoice amount.
+        raw_cost = self._value(usage, "cost")
+        try:
+            cost_usd = float(raw_cost) if raw_cost is not None else None
+        except (TypeError, ValueError):
+            cost_usd = None
+
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "profile_index": _request_context.get().get("profile_index"),
+            "model_requested": requested_model,
+            "model_returned": self._value(response, "model", requested_model),
+            "generation_id": self._value(response, "id"),
+            "prompt_tokens": self._value(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": self._value(usage, "completion_tokens", 0) or 0,
+            "total_tokens": self._value(usage, "total_tokens", 0) or 0,
+            "openrouter_cost_usd": cost_usd,
+        }
+        with self._lock:
+            self.events.append(event)
+
+    def report(self, status: str) -> Dict[str, Any]:
+        with self._lock:
+            events = list(self.events)
+
+        totals = {
+            "api_requests": len(events),
+            "prompt_tokens": sum(int(e["prompt_tokens"]) for e in events),
+            "completion_tokens": sum(int(e["completion_tokens"]) for e in events),
+            "total_tokens": sum(int(e["total_tokens"]) for e in events),
+        }
+        known_costs = [e["openrouter_cost_usd"] for e in events if e["openrouter_cost_usd"] is not None]
+        totals["openrouter_cost_usd"] = round(sum(known_costs), 10) if known_costs else None
+        totals["requests_with_openrouter_cost"] = len(known_costs)
+
+        per_profile: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"api_requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                     "total_tokens": 0, "openrouter_cost_usd": 0.0,
+                     "requests_with_openrouter_cost": 0}
+        )
+        for event in events:
+            if event["profile_index"] is None:
+                continue
+            bucket = per_profile[str(event["profile_index"])]
+            bucket["api_requests"] += 1
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                bucket[key] += int(event[key])
+            if event["openrouter_cost_usd"] is not None:
+                bucket["openrouter_cost_usd"] += event["openrouter_cost_usd"]
+                bucket["requests_with_openrouter_cost"] += 1
+        for bucket in per_profile.values():
+            bucket["openrouter_cost_usd"] = (
+                round(bucket["openrouter_cost_usd"], 10)
+                if bucket["requests_with_openrouter_cost"] else None
+            )
+
+        return {
+            "metadata": {
+                **self.run_metadata,
+                "started_at": self.started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "status": status,
+                "cost_source": "OpenRouter completion response usage.cost",
+                "note": "A null cost means the endpoint did not return OpenRouter billed cost; no local estimate is substituted.",
+            },
+            "totals": totals,
+            "per_profile": dict(per_profile),
+            "requests": events,
+        }
+
+    def write(self, status: str) -> Dict[str, Any]:
+        report = self.report(status)
+        os.makedirs(os.path.dirname(self.report_path), exist_ok=True)
+        with open(self.report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return report
+
+
+_cost_tracker: Optional[CostTracker] = None
+
+
+def start_cost_tracking(report_path: str, run_metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Start a new run-level cost ledger. Call after startup validation."""
+    global _cost_tracker
+    _cost_tracker = CostTracker(report_path, run_metadata)
+
+
+def set_request_context(**context: Any):
+    """Associate subsequent API calls in this thread with a profile/run context."""
+    return _request_context.set(context)
+
+
+def reset_request_context(token: Any) -> None:
+    _request_context.reset(token)
+
+
+def write_cost_report(status: str) -> Optional[Dict[str, Any]]:
+    """Persist the current ledger and return it, or None if tracking is off."""
+    return _cost_tracker.write(status) if _cost_tracker else None
+
+
 def set_api_delay(seconds: float) -> None:
     global API_DELAY
     API_DELAY = max(0.0, float(seconds or 0))
@@ -146,6 +280,8 @@ def get_completion(messages: List[Dict[str, str]], model: str = None,
     model = model or GPT_MODEL
     try:
         response = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+        if _cost_tracker:
+            _cost_tracker.record(response, model)
         return response.choices[0].message.content
     except Exception as e:
         print(f"API call failed: {e}")
